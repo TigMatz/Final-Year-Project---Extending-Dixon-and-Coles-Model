@@ -1,0 +1,170 @@
+#Here is the rolling window used to compare our model with 
+
+#Full Fixed Rolling Window Approach
+#  Load Required Libraries
+library(ggplot2)
+library(gridExtra)
+
+start_time <- Sys.time()
+
+#  Load and Prepare Data
+load_and_prepare_data <- function(file_path) {
+  match_data <- read.csv(file_path)
+  colnames(match_data)[colnames(match_data) == "ï..Date"] <- "Date"
+  match_data$Date <- as.Date(match_data$Date, format = "%d/%m/%Y")
+  match_data$FTHG <- as.numeric(match_data$FTHG)
+  match_data$FTAG <- as.numeric(match_data$FTAG)
+  match_data <- na.omit(match_data)
+  return(match_data)
+}
+
+
+# Dixon-Coles Functions
+dixon_coles_prob <- function(x, y, HomeTeam, AwayTeam, fteam_parameters, model_parameters) {
+  Home_Attack <- fteam_parameters[fteam_parameters$Team == HomeTeam, "Attack"]
+  Home_Defense <- fteam_parameters[fteam_parameters$Team == HomeTeam, "Defense"]
+  Away_Attack <- fteam_parameters[fteam_parameters$Team == AwayTeam, "Attack"]
+  Away_Defense <- fteam_parameters[fteam_parameters$Team == AwayTeam, "Defense"]
+  Home_Advantage <- model_parameters$home_advantage
+  rho <- model_parameters$rho
+
+  lambda <- exp(Home_Attack + Away_Defense + Home_Advantage)
+  mu <- exp(Away_Attack + Home_Defense)
+
+  tau <- if (x == 0 & y == 0) {
+    1 - rho * lambda * mu
+  } else if (x == 0 & y == 1) {
+    1 + rho * lambda
+  } else if (x == 1 & y == 0) {
+    1 + rho * mu
+  } else if (x == 1 & y == 1) {
+    1 - rho
+  } else {
+    1
+  }
+
+  tau <- ifelse(tau < 0, 0, tau)
+  poisson_home <- dpois(x, lambda)
+  poisson_away <- dpois(y, mu)
+
+  return(tau * poisson_home * poisson_away)
+}
+
+calculate_fixture_probabilities <- function(HomeTeam, AwayTeam, fteam_parameters, model_parameters, max_goals = 10) {
+  prob_matrix <- matrix(0, nrow = max_goals + 1, ncol = max_goals + 1)
+
+  for (x in 0:max_goals) {
+    for (y in 0:max_goals) {
+      prob_matrix[x + 1, y + 1] <- dixon_coles_prob(x, y, HomeTeam, AwayTeam, fteam_parameters, model_parameters)
+    }
+  }
+
+  prob_home_win <- sum(prob_matrix[lower.tri(prob_matrix, diag = FALSE)])
+  prob_draw <- sum(diag(prob_matrix))
+  prob_away_win <- sum(prob_matrix[upper.tri(prob_matrix, diag = FALSE)])
+
+  return(list(Home_Win = prob_home_win, Draw = prob_draw, Away_Win = prob_away_win))
+}
+
+#  Rolling Prediction with Updating
+rolling_window_prediction <- function(initial_data, rolling_data, decay_rate = 0.00186) {
+  match_data <- initial_data
+  parameter_history <- data.frame(MatchIndex = integer(), Team = character(), Attack = numeric(), Defense = numeric())
+  prediction_results <- data.frame(HomeTeam = character(), AwayTeam = character(), Actual_Result = character(), Predicted_Result = character())
+
+  correct_predictions <- 0
+  total_matches <- nrow(rolling_data)
+
+  for (i in 1:nrow(rolling_data)) {
+    match_data <- rbind(initial_data, rolling_data[1:i, ])
+    current_date <- rolling_data$Date[i] + 1
+
+    #  Call optimize_model_parameters with correct arguments
+    model_parameters <- optimize_model_parameters(match_data, decay_rate = decay_rate, current_date = current_date)
+
+    fteam_parameters <- data.frame(
+      Team = names(model_parameters$attack),
+      Attack = model_parameters$attack,
+      Defense = model_parameters$defense
+    )
+
+    home_team <- rolling_data$HomeTeam[i]
+    away_team <- rolling_data$AwayTeam[i]
+    probs <- calculate_fixture_probabilities(home_team, away_team, fteam_parameters, model_parameters)
+
+    result_labels <- c("H", "D", "A")
+    result_values <- c(probs$Home_Win, probs$Draw, probs$Away_Win)
+    predicted_result <- result_labels[which.max(result_values)]
+
+    actual_result <- ifelse(rolling_data$FTHG[i] > rolling_data$FTAG[i], "H",
+                            ifelse(rolling_data$FTHG[i] == rolling_data$FTAG[i], "D", "A"))
+
+    prediction_results <- rbind(prediction_results, data.frame(
+      HomeTeam = home_team,
+      AwayTeam = away_team,
+      Actual_Result = actual_result,
+      Predicted_Result = predicted_result
+    ))
+
+    if (predicted_result == actual_result) correct_predictions <- correct_predictions + 1
+
+    # Store team parameters for plotting
+    parameter_history <- rbind(parameter_history, data.frame(
+      MatchIndex = i,
+      Team = home_team,
+      Attack = fteam_parameters[fteam_parameters$Team == home_team, "Attack"],
+      Defense = fteam_parameters[fteam_parameters$Team == home_team, "Defense"]
+    ))
+
+    parameter_history <- rbind(parameter_history, data.frame(
+      MatchIndex = i,
+      Team = away_team,
+      Attack = fteam_parameters[fteam_parameters$Team == away_team, "Attack"],
+      Defense = fteam_parameters[fteam_parameters$Team == away_team, "Defense"]
+    ))
+  }
+
+  strike_rate <- (correct_predictions / total_matches) * 100
+
+  return(list(parameter_history = parameter_history, prediction_results = prediction_results, strike_rate = strike_rate))
+}
+
+#  Plot Team Parameters
+
+plot_team_parameters <- function(parameter_history) {
+  teams <- unique(parameter_history$Team)
+  plots <- list()
+
+  for (team in teams) {
+    team_data <- parameter_history[parameter_history$Team == team, ]
+
+    attack_plot <- ggplot(team_data, aes(x = MatchIndex, y = Attack)) +
+      geom_line(color = "blue", size = 1.5) +
+      labs(title = paste(team, "- Attack Evolution"), x = "Match", y = "Attack Strength") +
+      theme_minimal()
+
+    defense_plot <- ggplot(team_data, aes(x = MatchIndex, y = Defense)) +
+      geom_line(color = "red", size = 1.5) +
+      labs(title = paste(team, "- Defense Evolution"), x = "Match", y = "Defense Strength") +
+      theme_minimal()
+
+    plots[[team]] <- grid.arrange(attack_plot, defense_plot, nrow = 2)
+  }
+
+  return(plots)
+}
+
+#  Main Execution
+initial_data <- load_and_prepare_data() #here you input your file locations
+rolling_data <- load_and_prepare_data()
+
+result <- rolling_window_prediction(initial_data, rolling_data, decay_rate = 0.00186)
+
+cat("\n Strike Rate:", round(result$strike_rate, 2), "%\n")
+print(result$prediction_results)
+
+plots <- plot_team_parameters(result$parameter_history)
+
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(execution_time)
