@@ -1,0 +1,661 @@
+#Here is where we create our model, extending from the dixon and coles model 
+
+#First we start by estimating the paramaters from the teams in the premier league (this can be instead substituted for a top league)
+
+```{r}
+#Getting the Parameters from the Prem
+
+start_time <- Sys.time()
+# Load match data
+match_data <- read.csv() #input your file location 
+
+# Rename Date column if needed
+colnames(match_data)[colnames(match_data) == "ï..Date"] <- "Date"
+
+# Ensure Date column is in the correct format
+match_data$Date <- as.Date(match_data$Date, format = "%d/%m/%Y")
+
+# Convert Goals to Numeric and Remove Rows with Missing Values
+match_data$FTHG <- as.numeric(match_data$FTHG)
+match_data$FTAG <- as.numeric(match_data$FTAG)
+
+# Drop rows where any key column is missing
+match_data <- na.omit(match_data)
+
+# Automatically set chosen_date as the last date in the dataset
+chosen_date <- max(match_data$Date, na.rm = TRUE)
+
+# Function to calculate Dixon-Coles weights
+calculate_weights <- function(dates, current_date = chosen_date, decay_rate = 0.00186) {
+  datediffs <- as.numeric(dates - current_date) * -1
+  weights <- exp(-1 * decay_rate * datediffs)
+  weights[datediffs <= 0] <- 0  # Assign zero weights to future matches
+  return(weights)
+}
+
+# Vectorized Dixon-Coles tau adjustment function
+dixon_coles_tau <- Vectorize(function(home_goals, away_goals, lambda, mu, rho) {
+  if (is.na(home_goals) || is.na(away_goals)) {
+    return(1)  # Default adjustment factor if missing values
+  }
+  if (home_goals == 0 & away_goals == 0) {
+    return(1 - (lambda * mu * rho))
+  } else if (home_goals == 0 & away_goals == 1) {
+    return(1 + (lambda * rho))
+  } else if (home_goals == 1 & away_goals == 0) {
+    return(1 + (mu * rho))
+  } else if (home_goals == 1 & away_goals == 1) {
+    return(1 - rho)
+  } else {
+    return(1)
+  }
+})
+
+# Negative log-likelihood function with weights
+weighted_neg_log_likelihood <- function(params, home_goals, away_goals,
+                                        home_teams, away_teams, param_structure, weights = NULL) {
+  # Relist parameters
+  params_list <- relist(params, param_structure)
+  
+  # Enforce sum-to-zero constraint on defense parameters
+  params_list$defense <- c(sum(params_list$defense) * -1, params_list$defense)
+  names(params_list$defense)[1] <- names(params_list$attack[1])
+  
+  # Expected goals for home and away teams
+  expected_home <- exp(params_list$attack[home_teams] + params_list$defense[away_teams] + params_list$home_advantage)
+  expected_away <- exp(params_list$attack[away_teams] + params_list$defense[home_teams])
+  
+  # Apply Dixon-Coles tau adjustment
+  tau_adjustment <- dixon_coles_tau(home_goals, away_goals, expected_home, expected_away, rho = params_list$rho)
+  
+  # Handle invalid adjustments
+  if (any(tau_adjustment <= 0, na.rm = TRUE)) {
+    return(Inf)
+  }
+  
+  # Calculate log-likelihoods
+  log_likelihood_home <- dpois(home_goals, lambda = expected_home, log = TRUE)
+  log_likelihood_away <- dpois(away_goals, lambda = expected_away, log = TRUE)
+  
+  # Combine log-likelihoods
+  total_log_likelihood <- log_likelihood_home + log_likelihood_away + log(tau_adjustment)
+  
+  # Apply weights if provided
+  if (is.null(weights)) {
+    weights <- rep(1, length(total_log_likelihood))
+  }
+  
+  weighted_log_likelihood <- sum(total_log_likelihood * weights, na.rm = TRUE)
+  
+  # Return negative log-likelihood
+  return(weighted_log_likelihood * -1)
+}
+
+# Main function to optimize parameters
+optimize_model_parameters <- function(match_data, decay_rate = 0.00186) {
+  # Extract unique teams
+  teams <- sort(unique(c(match_data$HomeTeam, match_data$AwayTeam)))
+  num_teams <- length(teams)
+  
+  # Ensure there are enough teams
+  if (num_teams < 2) {
+    stop("Insufficient unique teams in the dataset.")
+  }
+  
+  # Initialize parameters
+  param_list <- list(
+    attack = rep(0.2, num_teams),
+    defense = rep(-0.01, num_teams - 1),
+    home_advantage = 0.1,
+    rho = 0.0
+  )
+  names(param_list$attack) <- teams
+  names(param_list$defense) <- teams[-1]
+  
+  # Prepare data for optimization
+  home_goals <- match_data$FTHG
+  away_goals <- match_data$FTAG
+  home_teams <- match_data$HomeTeam
+  away_teams <- match_data$AwayTeam
+  match_dates <- as.Date(match_data$Date)
+  
+  # Calculate weights
+  match_weights <- calculate_weights(match_dates, current_date = chosen_date, decay_rate = decay_rate)
+  
+  # Run optimization
+  optim_result <- optim(
+    par = unlist(param_list),
+    fn = weighted_neg_log_likelihood,
+    home_goals = home_goals,
+    away_goals = away_goals,
+    home_teams = home_teams,
+    away_teams = away_teams,
+    param_structure = param_list,
+    weights = match_weights,
+    method = "BFGS"
+  )
+  
+  # Relist and finalize parameters
+  final_params <- relist(optim_result$par, param_list)
+  final_params$defense <- c(sum(final_params$defense) * -1, final_params$defense)
+  names(final_params$defense)[1] <- names(final_params$attack[1])
+  
+  return(final_params)
+}
+
+# Run the parameter optimization
+model_parameters <- optimize_model_parameters(match_data, decay_rate = 0.00186)
+
+# Print results
+cat("Attack Parameters:\n")
+print(model_parameters$attack)
+
+cat("\nDefense Parameters:\n")
+print(model_parameters$defense)
+
+cat("\nHome Advantage:\n")
+print(model_parameters$home_advantage)
+
+cat("\nRho (Score Correlation):\n")
+print(model_parameters$rho)
+
+# Calculate average attack and defense parameters
+average_attack <- mean(model_parameters$attack, na.rm = TRUE)
+average_defense <- mean(model_parameters$defense, na.rm = TRUE)
+
+cat("\nAverage Attack Parameter:", round(average_attack, 4), "\n")
+cat("Average Defense Parameter:", round(average_defense, 4), "\n")
+
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(execution_time)
+```
+
+#Next we create a data frame for these parameters 
+```{r}
+# Create a data frame with attack and defense parameters
+wteam_parameters <- data.frame(
+  Team = names(model_parameters$attack),
+  Attack = as.numeric(model_parameters$attack),
+  Defense = as.numeric(model_parameters$defense)
+)
+
+# Print the resulting matrix
+print(wteam_parameters)
+```
+
+#Next we estimate the parameters from the championship (or lower league)
+
+```{r}
+#Getting Parameters from Championship Data
+# Load Required Libraries
+library(stats)
+start_time <- Sys.time()
+# Load match data
+match_data <- read.csv(, stringsAsFactors = FALSE) #input your file location here 
+
+# Rename Date column if needed
+colnames(match_data)[colnames(match_data) == "ï..Date"] <- "Date"
+
+# Ensure Date column is in the correct format
+match_data$Date <- as.Date(match_data$Date, format = "%d/%m/%Y")
+
+# Convert Goals to Numeric and Remove Rows with Missing Values
+match_data$FTHG <- as.numeric(match_data$FTHG)
+match_data$FTAG <- as.numeric(match_data$FTAG)
+
+# Drop rows where any key column is missing
+match_data <- na.omit(match_data)
+
+# Automatically set chosen_date as the last date in the dataset
+chosen_date <- max(match_data$Date, na.rm = TRUE)
+
+# Function to calculate Dixon-Coles weights
+calculate_weights <- function(dates, current_date = chosen_date, decay_rate = 0.00186) {
+  datediffs <- as.numeric(dates - current_date) * -1
+  weights <- exp(-1 * decay_rate * datediffs)
+  weights[datediffs <= 0] <- 0  # Assign zero weights to future matches
+  return(weights)
+}
+
+# Vectorized Dixon-Coles tau adjustment function
+dixon_coles_tau <- Vectorize(function(home_goals, away_goals, lambda, mu, rho) {
+  if (is.na(home_goals) || is.na(away_goals)) {
+    return(1)  # Default adjustment factor if missing values
+  }
+  if (home_goals == 0 & away_goals == 0) {
+    return(1 - (lambda * mu * rho))
+  } else if (home_goals == 0 & away_goals == 1) {
+    return(1 + (lambda * rho))
+  } else if (home_goals == 1 & away_goals == 0) {
+    return(1 + (mu * rho))
+  } else if (home_goals == 1 & away_goals == 1) {
+    return(1 - rho)
+  } else {
+    return(1)
+  }
+})
+
+# Negative log-likelihood function with weights
+weighted_neg_log_likelihood <- function(params, home_goals, away_goals,
+                                        home_teams, away_teams, param_structure, weights = NULL) {
+  # Relist parameters
+  params_list <- relist(params, param_structure)
+  
+  # Enforce sum-to-zero constraint on defense parameters
+  params_list$defense <- c(sum(params_list$defense) * -1, params_list$defense)
+  names(params_list$defense)[1] <- names(params_list$attack[1])
+  
+  # Expected goals for home and away teams
+  expected_home <- exp(params_list$attack[home_teams] + params_list$defense[away_teams] + params_list$home_advantage)
+  expected_away <- exp(params_list$attack[away_teams] + params_list$defense[home_teams])
+  
+  # Apply Dixon-Coles tau adjustment
+  tau_adjustment <- dixon_coles_tau(home_goals, away_goals, expected_home, expected_away, rho = params_list$rho)
+  
+  # Handle invalid adjustments
+  if (any(tau_adjustment <= 0, na.rm = TRUE)) {
+    return(Inf)
+  }
+  
+  # Calculate log-likelihoods
+  log_likelihood_home <- dpois(home_goals, lambda = expected_home, log = TRUE)
+  log_likelihood_away <- dpois(away_goals, lambda = expected_away, log = TRUE)
+  
+  # Combine log-likelihoods
+  total_log_likelihood <- log_likelihood_home + log_likelihood_away + log(tau_adjustment)
+  
+  # Apply weights if provided
+  if (is.null(weights)) {
+    weights <- rep(1, length(total_log_likelihood))
+  }
+  
+  weighted_log_likelihood <- sum(total_log_likelihood * weights, na.rm = TRUE)
+  
+  # Return negative log-likelihood
+  return(weighted_log_likelihood * -1)
+}
+
+# Main function to optimize parameters
+optimize_parameters <- function(match_data, decay_rate = 0.00186) {
+  # Extract unique teams
+  teams <- sort(unique(c(match_data$HomeTeam, match_data$AwayTeam)))
+  num_teams <- length(teams)
+  
+  # Ensure there are enough teams
+  if (num_teams < 2) {
+    stop("Insufficient unique teams in the dataset.")
+  }
+  
+  # Initialize parameters
+  parameter_list <- list(
+    attack = rep(0.2, num_teams),
+    defense = rep(-0.01, num_teams - 1),
+    home_advantage = 0.1,
+    rho = 0.0
+  )
+  names(parameter_list$attack) <- teams
+  names(parameter_list$defense) <- teams[-1]
+  
+  # Prepare data for optimization
+  home_goals <- match_data$FTHG
+  away_goals <- match_data$FTAG
+  home_teams <- match_data$HomeTeam
+  away_teams <- match_data$AwayTeam
+  match_dates <- as.Date(match_data$Date)
+  
+  # Calculate weights
+  match_weights <- calculate_weights(match_dates, current_date = chosen_date, decay_rate = decay_rate)
+  
+  # Run optimization
+  optim_result <- optim(
+    par = unlist(parameter_list),
+    fn = weighted_neg_log_likelihood,
+    home_goals = home_goals,
+    away_goals = away_goals,
+    home_teams = home_teams,
+    away_teams = away_teams,
+    param_structure = parameter_list,
+    weights = match_weights,
+    method = "BFGS"
+  )
+  
+  # Relist and finalize parameters
+  final_params <- relist(optim_result$par, parameter_list)
+  final_params$defense <- c(sum(final_params$defense) * -1, final_params$defense)
+  names(final_params$defense)[1] <- names(final_params$attack[1])
+  
+  return(final_params)
+}
+
+# Run the parameter optimization
+optimized_parameters <- optimize_parameters(match_data, decay_rate = 0.00186)
+
+# Print results
+cat("Attack Parameters:\n")
+print(optimized_parameters$attack)
+
+cat("\nDefense Parameters:\n")
+print(optimized_parameters$defense)
+
+cat("\nHome Advantage:\n")
+print(optimized_parameters$home_advantage)
+
+cat("\nRho (Score Correlation):\n")
+print(optimized_parameters$rho)
+
+# Calculate average attack and defense parameters
+average_attack <- mean(optimized_parameters$attack, na.rm = TRUE)
+average_defense <- mean(optimized_parameters$defense, na.rm = TRUE)
+
+cat("\nAverage Attack Parameter:", round(average_attack, 4), "\n")
+cat("Average Defense Parameter:", round(average_defense, 4), "\n")
+
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(execution_time)
+```
+#Now using this championship data, as well as the premier league data, we select the teams that we want and predict the teams that are promoted from the championship using the normal distribution that we found 
+
+```{r}
+#Predicting Prem from Championship
+# Load Required Libraries
+library(stats)
+start_time <- Sys.time()
+#  Load Championship Parameters
+match_data <- read.csv(, stringsAsFactors = FALSE) #input your file location here 
+colnames(match_data)[colnames(match_data) == "ï..Date"] <- "Date"
+match_data$Date <- as.Date(match_data$Date, format = "%d/%m/%Y")
+match_data$FTHG <- as.numeric(match_data$FTHG)
+match_data$FTAG <- as.numeric(match_data$FTAG)
+match_data <- na.omit(match_data)
+chosen_date <- max(match_data$Date, na.rm = TRUE)
+
+# Optimize Championship Parameters
+optimized_parameters <- optimize_parameters(match_data, decay_rate = 0.00186)
+
+# Functions to Calculate Attack and Defense Values
+#You can input your own normal distribution for other leagues here 
+calculate_attack_values <- function(x) {
+  mean_value <- 0.328247026
+  std_dev <- 0.144730334
+  constant_value <- -0.202685204
+  if (x <= mean_value) {
+    probability <- pnorm(mean_value, mean = mean_value, sd = std_dev) - pnorm(x, mean = mean_value, sd = std_dev)
+    return(constant_value * (1 + probability))
+  } else {
+    probability <- pnorm(x, mean = mean_value, sd = std_dev) - pnorm(mean_value, mean = mean_value, sd = std_dev)
+    return(constant_value * (1 - probability))
+  }
+}
+
+calculate_defense_values <- function(x) {
+  mean_value <- -0.264994697
+  std_dev <- 0.173797899
+  constant_value <- 0.186302399
+  if (x <= mean_value) {
+    probability <- pnorm(mean_value, mean = mean_value, sd = std_dev) - pnorm(x, mean = mean_value, sd = std_dev)
+    return(constant_value * (1 - probability))
+  } else {
+    probability <- pnorm(x, mean = mean_value, sd = std_dev) - pnorm(mean_value, mean = mean_value, sd = std_dev)
+    return(constant_value * (1 + probability))
+  }
+}
+
+#  Load wteam_parameters from Selected Teams in model_parameters
+# Ensure that model_parameters exists and contains attack and defense
+if (!exists("model_parameters")) stop("Error: model_parameters does not exist.")
+
+# List of selected teams 
+selected_teams_wteam <- c("Arsenal","Aston Villa","Bournemouth","Brentford","Brighton","Chelsea","Crystal Palace","Everton","Fulham","Liverpool","Man City","Man United","Newcastle","Nott'm Forest","Tottenham","West Ham","Wolves") #these are the list of teams who stayed in the prem from the previous season
+
+# Create a data frame with only the selected teams
+wteam_parameters <- data.frame(
+  Team = selected_teams_wteam,
+  Attack = unlist(lapply(selected_teams_wteam, function(team) model_parameters$attack[team])),
+  Defense = unlist(lapply(selected_teams_wteam, function(team) model_parameters$defense[team])),
+  stringsAsFactors = FALSE
+)
+
+# Remove any NA values (for teams that might not exist in model_parameters)
+wteam_parameters <- na.omit(wteam_parameters)
+
+#  Predict Premier League Parameters for Selected Championship Teams
+selected_teams_championship <- c("Ipswich", "Southampton","Leicester") #these are the teams that got promoted to the premier league from the championship
+
+# Filter only selected teams from optimized_parameters
+valid_teams <- selected_teams_championship[selected_teams_championship %in% names(optimized_parameters$attack)]
+championship_teams <- data.frame()
+
+if (length(valid_teams) > 0) {
+  championship_teams <- data.frame(
+    Team = valid_teams,
+    ChampionshipAttack = unname(optimized_parameters$attack[valid_teams]),
+    ChampionshipDefence = unname(optimized_parameters$defense[valid_teams]),
+    stringsAsFactors = FALSE
+  )
+
+  # Predict Premier League parameters using the provided functions
+  championship_teams$PredPremAttack <- sapply(championship_teams$ChampionshipAttack, calculate_attack_values)
+  championship_teams$PredPremDefence <- sapply(championship_teams$ChampionshipDefence, calculate_defense_values)
+}
+
+#  Combine wteam_parameters and Championship Teams
+# Remove selected championship teams from wteam_parameters before merging
+wteam_parameters <- wteam_parameters[!wteam_parameters$Team %in% selected_teams_championship, ]
+
+# Combine both data frames
+fteam_parameters <- rbind(
+  wteam_parameters,
+  data.frame(
+    Team = championship_teams$Team,
+    Attack = championship_teams$PredPremAttack,
+    Defense = championship_teams$PredPremDefence,
+    stringsAsFactors = FALSE
+  )
+)
+
+# Print Final Results
+
+if (nrow(championship_teams) > 0) {
+  print("Championship Teams with Predicted Premier League Parameters:")
+  print(championship_teams[, c("Team", "ChampionshipAttack", "ChampionshipDefence", "PredPremAttack", "PredPremDefence")])
+}
+
+print("\nFinal fteam_parameters Matrix:")
+print(fteam_parameters)
+
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(execution_time)
+```
+#Now we use these parameters that we found to predict a season using our model 
+
+```{r}
+#Our Model
+# Load Required Libraries
+library(ggplot2)
+library(gridExtra)
+start_time <- Sys.time()
+#  Load CSV file into R
+file_path <- #input your file path here  
+fixturestest <- read.csv(file_path, stringsAsFactors = FALSE)
+
+# Ensure the first column is treated as the Date column
+colnames(fixturestest)[1] <- "Date"
+fixturestest$Date <- as.Date(fixturestest$Date, format="%d/%m/%Y")
+
+# Ensure column names match expected format
+colnames(fixturestest)[2:5] <- c("HomeTeam", "AwayTeam", "FTHG", "FTAG")
+
+# Check that the required columns exist
+required_columns <- c("Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG")
+if (!all(required_columns %in% colnames(fixturestest))) {
+  stop("Error: The CSV file must contain the columns Date, HomeTeam, AwayTeam, FTHG, FTAG")
+}
+
+
+#  Function to calculate expected goals
+calculate_expected_goals <- function(HomeTeam, AwayTeam, team_parameters, home_advantage) {
+  home_index <- match(HomeTeam, team_parameters$Team)
+  away_index <- match(AwayTeam, team_parameters$Team)
+  
+  if (is.na(home_index) || is.na(away_index)) {
+    cat("Skipping match:", HomeTeam, "vs", AwayTeam, "- Missing team parameters\n")
+    return(NULL) 
+  }
+
+  Home_Attack <- team_parameters$Attack[home_index]
+  Home_Defense <- team_parameters$Defense[home_index]
+  Away_Attack <- team_parameters$Attack[away_index]
+  Away_Defense <- team_parameters$Defense[away_index]
+
+  Expected_Home_Goals <- exp(Home_Attack + Away_Defense + home_advantage)
+  Expected_Away_Goals <- exp(Away_Attack + Home_Defense)
+
+  return(list(Expected_Home_Goals = Expected_Home_Goals, Expected_Away_Goals = Expected_Away_Goals))
+}
+
+
+# Function to calculate match probabilities
+
+calculate_match_probabilities <- function(Expected_Home_Goals, Expected_Away_Goals, rho, max_goals = 10) {
+  prob_matrix <- outer(0:max_goals, 0:max_goals, function(x, y) {
+    dpois(x, Expected_Home_Goals) * dpois(y, Expected_Away_Goals)
+  })
+
+  prob_home_win <- sum(prob_matrix[lower.tri(prob_matrix, diag = FALSE)])
+  prob_draw <- sum(diag(prob_matrix))
+  prob_away_win <- sum(prob_matrix[upper.tri(prob_matrix, diag = FALSE)])
+
+  result_labels <- c("H", "D", "A")
+  predicted_result <- result_labels[which.max(c(prob_home_win, prob_draw, prob_away_win))]
+
+  return(list(Home_Win = prob_home_win, Draw = prob_draw, Away_Win = prob_away_win, Predicted_Result = predicted_result))
+}
+
+
+# Function to update parameters sequentially & store history
+
+update_parameters_sequentially <- function(fixturestest, fteam_parameters, model_parameters, learning_rate = 0.031) {
+  
+  new_fteam_parameters <- fteam_parameters
+  
+  # Create history matrices for parameters & match probabilities
+  match_history <- data.frame(
+    MatchCount = integer(),
+    HomeTeam = character(),
+    AwayTeam = character(),
+    Home_Win_Prob = numeric(),
+    Draw_Prob = numeric(),
+    Away_Win_Prob = numeric(),
+    Predicted_Result = character(),
+    Actual_Result = character(),
+    stringsAsFactors = FALSE
+  )
+
+  parameter_history <- data.frame(
+    MatchCount = integer(),
+    Team = character(),
+    Attack = numeric(),
+    Defense = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  correct_predictions <- 0  
+  total_matches <- 0   
+
+  team_match_counts <- setNames(rep(0, nrow(fteam_parameters)), fteam_parameters$Team)
+
+  for (i in 1:nrow(fixturestest)) {
+    HomeTeam <- fixturestest$HomeTeam[i]
+    AwayTeam <- fixturestest$AwayTeam[i]
+    Actual_Home_Goals <- fixturestest$FTHG[i]
+    Actual_Away_Goals <- fixturestest$FTAG[i]
+
+    expected_goals <- calculate_expected_goals(HomeTeam, AwayTeam, new_fteam_parameters, model_parameters$home_advantage)
+    
+    if (is.null(expected_goals)) next  
+
+    total_matches <- total_matches + 1  
+
+    Expected_Home_Goals <- expected_goals$Expected_Home_Goals
+    Expected_Away_Goals <- expected_goals$Expected_Away_Goals
+
+    match_probs <- calculate_match_probabilities(Expected_Home_Goals, Expected_Away_Goals, model_parameters$rho)
+
+    if (Actual_Home_Goals > Actual_Away_Goals) {
+      Actual_Result <- "H"
+    } else if (Actual_Home_Goals == Actual_Away_Goals) {
+      Actual_Result <- "D"
+    } else {
+      Actual_Result <- "A"
+    }
+
+    if (match_probs$Predicted_Result == Actual_Result) {
+      correct_predictions <- correct_predictions + 1
+    }
+
+    home_index <- match(HomeTeam, new_fteam_parameters$Team)
+    away_index <- match(AwayTeam, new_fteam_parameters$Team)
+
+    Home_Attack <- new_fteam_parameters$Attack[home_index]
+    Home_Defense <- new_fteam_parameters$Defense[home_index]
+    Away_Attack <- new_fteam_parameters$Attack[away_index]
+    Away_Defense <- new_fteam_parameters$Defense[away_index]
+
+    new_fteam_parameters$Attack[home_index] <- Home_Attack + learning_rate * (Actual_Home_Goals - Expected_Home_Goals)
+    new_fteam_parameters$Attack[away_index] <- Away_Attack + learning_rate * (Actual_Away_Goals - Expected_Away_Goals)
+    
+      new_fteam_parameters$Defense[home_index] <- Home_Defense + learning_rate * (Actual_Away_Goals - Expected_Away_Goals)
+    new_fteam_parameters$Defense[away_index] <- Away_Defense + learning_rate * (Actual_Home_Goals - Expected_Home_Goals)
+
+    team_match_counts[HomeTeam] <- team_match_counts[HomeTeam] + 1
+    team_match_counts[AwayTeam] <- team_match_counts[AwayTeam] + 1
+
+    parameter_history <- rbind(
+      parameter_history,
+      data.frame(MatchCount = team_match_counts[HomeTeam], Team = HomeTeam, Attack = new_fteam_parameters$Attack[home_index], Defense = new_fteam_parameters$Defense[home_index]),
+      data.frame(MatchCount = team_match_counts[AwayTeam], Team = AwayTeam, Attack = new_fteam_parameters$Attack[away_index], Defense = new_fteam_parameters$Defense[away_index])
+    )
+  }
+
+  strike_rate <- if (total_matches > 0) (correct_predictions / total_matches) * 100 else NA
+
+  return(list(updated_parameters = new_fteam_parameters, parameter_history = parameter_history, strike_rate = strike_rate))
+}
+
+#  Run the sequential parameter update
+result <- update_parameters_sequentially(fixturestest, fteam_parameters, model_parameters)
+
+
+#  Generate Individual Plots for Each Team
+teams <- unique(result$parameter_history$Team)
+plots <- list()
+
+for (team in teams) {
+  team_data <- subset(result$parameter_history, Team == team)   
+
+  attack_plot <- ggplot(team_data, aes(x = MatchCount, y = Attack)) +
+    geom_line(color = "blue") +
+    labs(title = paste(team, "- Attack Evolution"), x = "Matches Played", y = "Attack Strength") +
+    theme_minimal()
+
+  defense_plot <- ggplot(team_data, aes(x = MatchCount, y = Defense)) +
+    geom_line(color = "red") +
+    labs(title = paste(team, "- Defense Evolution"), x = "Matches Played", y = "Defense Strength") +
+    theme_minimal()
+
+  plots[[team]] <- grid.arrange(attack_plot, defense_plot, nrow = 2)
+}
+
+
+#  Display the plots
+
+plots
+end_time <- Sys.time()
+execution_time <- end_time - start_time
+print(execution_time)
+
+cat("\n Prediction Strike Rate:", round(result$strike_rate, 2), "%\n")
+```
