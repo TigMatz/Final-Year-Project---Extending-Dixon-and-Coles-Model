@@ -192,3 +192,176 @@ gteam_parameters <- na.omit(gteam_parameters)
 cat("\n Selected Team Parameters Matrix:\n")
 print(gteam_parameters)
 ```
+
+#Now this is where we take the parameters and predict the season that we want
+```{r}
+#  Function to calculate Dixon-Coles probabilities
+dixon_coles_prob <- function(x, y, HomeTeam, AwayTeam) {
+  # Fetch team parameters from gteam_parameters
+  Home_Attack <- gteam_parameters[gteam_parameters$Team == HomeTeam, "Attack"]
+  Home_Defense <- gteam_parameters[gteam_parameters$Team == HomeTeam, "Defense"]
+  Away_Attack <- gteam_parameters[gteam_parameters$Team == AwayTeam, "Attack"]
+  Away_Defense <- gteam_parameters[gteam_parameters$Team == AwayTeam, "Defense"]
+  Home_Advantage <- model_parameters$home_advantage
+  rho <- model_parameters$rho
+  
+  # Check if parameters are missing
+  if (length(Home_Attack) == 0 || length(Home_Defense) == 0 ||
+      length(Away_Attack) == 0 || length(Away_Defense) == 0) {
+    stop(paste("Missing parameters for", HomeTeam, "or", AwayTeam))
+  }
+  
+  # Expected goals
+  lambda <- exp(Home_Attack + Away_Defense + Home_Advantage)
+  mu <- exp(Away_Attack + Home_Defense)
+  
+  # Correlation adjustment factor
+  tau <- if (x == 0 & y == 0) {
+    1 - rho * lambda * mu
+  } else if (x == 0 & y == 1) {
+    1 + rho * lambda
+  } else if (x == 1 & y == 0) {
+    1 + rho * mu
+  } else if (x == 1 & y == 1) {
+    1 - rho
+  } else {
+    1
+  }
+  
+  tau <- ifelse(tau < 0, 0, tau)
+  
+  # Poisson probabilities
+  poisson_home <- dpois(x, lambda)
+  poisson_away <- dpois(y, mu)
+  
+  return(tau * poisson_home * poisson_away)
+}
+
+# Generate Probability Matrix for a Fixture
+generate_probability_matrix <- function(HomeTeam, AwayTeam, max_goals = 10) {
+  prob_matrix <- matrix(0, nrow = max_goals + 1, ncol = max_goals + 1,
+                        dimnames = list(HomeGoals = 0:max_goals, AwayGoals = 0:max_goals))
+  
+  for (x in 0:max_goals) {
+    for (y in 0:max_goals) {
+      prob_matrix[x + 1, y + 1] <- tryCatch({
+        dixon_coles_prob(x, y, HomeTeam, AwayTeam)
+      }, error = function(e) {
+        cat("Error in dixon_coles_prob for", HomeTeam, "vs", AwayTeam, "\n")
+        print(e)
+        return(NA)
+      })
+    }
+  }
+  
+  return(prob_matrix)
+}
+
+# Calculate Probabilities for a Fixture
+calculate_fixture_probabilities <- function(HomeTeam, AwayTeam, max_goals = 10) {
+  prob_matrix <- generate_probability_matrix(HomeTeam, AwayTeam, max_goals)
+  
+  if (any(is.na(prob_matrix))) {
+    return(list(Home_Win = NA, Draw = NA, Away_Win = NA))
+  }
+  
+  # Calculate outcome probabilities
+  prob_home_win <- sum(prob_matrix[lower.tri(prob_matrix, diag = FALSE)])
+  prob_draw <- sum(diag(prob_matrix))
+  prob_away_win <- sum(prob_matrix[upper.tri(prob_matrix, diag = FALSE)])
+  
+  return(list(Home_Win = prob_home_win, Draw = prob_draw, Away_Win = prob_away_win))
+}
+
+# Predict Probabilities for Fixtures and Calculate Strike Rate
+predict_probabilities <- function(fixtures, max_goals = 10) {
+  # Add columns for probabilities, predicted result, and actual result
+  fixtures$Home_Win <- NA
+  fixtures$Draw <- NA
+  fixtures$Away_Win <- NA
+  fixtures$Predicted_Result <- NA  
+  fixtures$Actual_Result <- NA  
+  
+  correct_predictions <- 0
+  total_matches <- nrow(fixtures)
+
+  for (i in 1:nrow(fixtures)) {
+    HomeTeam <- fixtures$HomeTeam[i]
+    AwayTeam <- fixtures$AwayTeam[i]
+    
+    # Get actual result
+    if (fixtures$FTHG[i] > fixtures$FTAG[i]) {
+      fixtures$Actual_Result[i] <- "H"
+    } else if (fixtures$FTHG[i] == fixtures$FTAG[i]) {
+      fixtures$Actual_Result[i] <- "D"
+    } else {
+      fixtures$Actual_Result[i] <- "A"
+    }
+    
+    # Calculate probabilities
+    probs <- tryCatch({
+      calculate_fixture_probabilities(HomeTeam, AwayTeam, max_goals)
+    }, error = function(e) {
+      cat("Error for fixture:", HomeTeam, "vs", AwayTeam, "\n")
+      print(e)
+      return(list(Home_Win = NA, Draw = NA, Away_Win = NA))
+    })
+    
+    # Store probabilities
+    fixtures$Home_Win[i] <- probs$Home_Win
+    fixtures$Draw[i] <- probs$Draw
+    fixtures$Away_Win[i] <- probs$Away_Win
+    
+    # Determine predicted result
+    result_labels <- c("H", "D", "A")  # H = Home Win, D = Draw, A = Away Win
+    result_values <- c(probs$Home_Win, probs$Draw, probs$Away_Win)
+    
+    if (all(is.na(result_values))) {
+      fixtures$Predicted_Result[i] <- NA  # Assign NA if no valid probabilities
+    } else {
+      fixtures$Predicted_Result[i] <- result_labels[which.max(result_values)]
+    }
+
+    # Compare predicted result with actual result
+    if (!is.na(fixtures$Predicted_Result[i]) && fixtures$Predicted_Result[i] == fixtures$Actual_Result[i]) {
+      correct_predictions <- correct_predictions + 1
+    }
+  }
+  
+  # Calculate strike rate
+  strike_rate <- (correct_predictions / total_matches) * 100
+  
+  return(list(fixtures = fixtures, strike_rate = strike_rate))
+}
+
+# Load Fixtures for Prediction
+fixtures <- read.csv(, stringsAsFactors = FALSE) #this is where you input your file location
+
+# Ensure necessary columns exist
+required_columns <- c("HomeTeam", "AwayTeam", "FTHG", "FTAG")
+if (!all(required_columns %in% colnames(fixtures))) {
+  stop("Error: The CSV file must contain the columns HomeTeam, AwayTeam, FTHG, FTAG")
+}
+
+#  Ensure goals are numeric
+fixtures$FTHG <- as.numeric(fixtures$FTHG)
+fixtures$FTAG <- as.numeric(fixtures$FTAG)
+
+#  Remove rows with missing goals
+fixtures <- na.omit(fixtures)
+
+#  Check how many rows remain
+cat("Total matches after removing missing values:", nrow(fixtures), "\n")
+
+#  Predict probabilities and results
+prediction_results <- predict_probabilities(fixtures, max_goals = 10)
+
+#  Extract updated fixture list and strike rate
+predicted_fixtures <- prediction_results$fixtures
+strike_rate <- prediction_results$strike_rate
+
+#  Print the results
+print(predicted_fixtures)
+cat("\n Strike Rate:", round(strike_rate, 4), "%\n")
+
+```
